@@ -72,10 +72,12 @@ struct ProxyChecks {
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
         let listener = try NWListener(using: parameters)
         var tunnels: [NordRelay.Tunnel] = []
+        var completions: [String?] = []
         defer { listener.cancel(); tunnels.forEach { $0.end() } }
         listener.newConnectionHandler = { connection in
             MainActor.assumeIsolated {
-                let tunnel = NordRelay.Tunnel(client: connection, script: script, localSecret: "fixture-token") { _, _, _ in ["username": "fixture", "password": "fixture-password"] }
+                let tunnel = NordRelay.Tunnel(client: connection, script: script, localSecret: "fixture-token") { _, _, _ in ["username": "fixture", "password": "fixture-password", "requestID": "half-close-fixture"] }
+                tunnel.onCompletion = { _, _, error in completions.append(error) }
                 tunnels.append(tunnel); tunnel.start()
             }
         }
@@ -95,9 +97,10 @@ struct ProxyChecks {
         let client = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
         defer { client.cancel() }
         let basic = Data("Search:fixture-token".utf8).base64EncodedString()
-        let request = "CONNECT half-close.invalid:80 HTTP/1.1\r\nProxy-Authorization: Basic \(basic)\r\n\r\nGET / HTTP/1.1\r\nHost: half-close.invalid\r\nConnection: close\r\n\r\n"
+        let connect = "CONNECT half-close.invalid:80 HTTP/1.1\r\nProxy-Authorization: Basic \(basic)\r\n\r\n"
+        let request = "GET / HTTP/1.1\r\nHost: half-close.invalid\r\nConnection: close\r\n\r\n"
         let received: Data = try await withCheckedThrowingContinuation { continuation in
-            var result = Data(), done = false
+            var result = Data(), done = false, sentRequest = false
             func finish(_ error: Error? = nil) {
                 guard !done else { return }; done = true
                 if let error { continuation.resume(throwing: error) } else { continuation.resume(returning: result) }
@@ -106,15 +109,21 @@ struct ProxyChecks {
                 client.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, complete, error in
                     MainActor.assumeIsolated {
                         if let data { result.append(data) }
-                        if String(decoding: result, as: UTF8.self).contains("authenticated WebKit traffic") { finish() }
-                        else if error != nil || complete { finish(error) } else { read() }
+                        if !sentRequest, String(decoding: result, as: UTF8.self).contains("200 Connection Established\r\n\r\n") {
+                            guard completions.isEmpty else { finish(NSError(domain: "CONNECT readiness falsely completed the request", code: 1)); return }
+                            sentRequest = true
+                            client.send(content: Data(request.utf8), contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { error in
+                                MainActor.assumeIsolated { if let error { finish(error) } }
+                            })
+                        }
+                        if error != nil || complete { finish(error) } else { read() }
                     }
                 }
             }
             client.stateUpdateHandler = { state in MainActor.assumeIsolated {
                 switch state {
                 case .ready:
-                    client.send(content: Data(request.utf8), contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in }); read()
+                    client.send(content: Data(connect.utf8), completion: .contentProcessed { error in MainActor.assumeIsolated { if let error { finish(error) } } }); read()
                 case .failed(let error): finish(error)
                 default: break
                 }
@@ -123,6 +132,8 @@ struct ProxyChecks {
             Task { try? await Task.sleep(for: .seconds(10)); finish(NSError(domain: "half-close timeout: client=\(client.state) tunnels=\(tunnels.count) header=\(tunnels.first?.header.count ?? 0) ready=\(tunnels.first?.ready ?? false) ended=\(tunnels.first?.ended ?? false) upstream=\(String(describing: tunnels.first?.upstream?.state))", code: 1)) }
         }
         try require(String(decoding: received, as: UTF8.self).contains("authenticated WebKit traffic"), "client half-close dropped the upstream response")
+        for _ in 0..<10 where completions.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+        try require(completions.count == 1, "tunnel termination did not release pending authentication exactly once: \(completions)")
     }
 
     @available(macOS 15.4, *)
@@ -157,6 +168,8 @@ struct ProxyChecks {
         let secure = try NordRoute.evaluate("function FindProxyForURL() { return 'HTTPS proxy.example:443'; }", host: "test.invalid", port: 443)
         let plain = try NordRoute.evaluate("function FindProxyForURL() { return 'PROXY proxy.example:80'; }", host: "test.invalid", port: 443)
         try require(secure.kind == .https && plain.kind == .http, "PAC confused proxy TLS with destination TLS")
+        let commented = try NordRoute.evaluate("function FindProxyForURL() { return 'HTTPS proxy.example:443'; }// EOF comment", host: "test.invalid", port: 443)
+        try require(commented.kind == .https, "PAC EOF comment swallowed TLS adapter")
         let killed = try NordRoute.evaluate("function FindProxyForURL() { return 'PROXY localhost:0'; }", host: "test.invalid", port: 443)
         try require(killed.kind == .blocked, "Nord kill switch was not blocked")
         Extensions.rememberedNordIsEnabled = true

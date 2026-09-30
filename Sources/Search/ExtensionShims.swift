@@ -4175,7 +4175,6 @@ enum ExtensionShims {
         let parts = api.split(separator: ":", maxSplits: 1).map(String.init)
         guard parts.count == 2 else { return nil }
         let name = parts[1]
-        var mine = Extensions.settings(for: id)
         if name == "proxy.settings", parts[0] != "setting.get" {
             if parts[0] == "setting.clear" {
                 guard id == NordProxy.extensionID else { throw Unsupported(what: "This proxy extension has no native routing support") }
@@ -4185,6 +4184,8 @@ enum ExtensionShims {
                 try await NordProxy.shared.set(value, context: context)
             }
         }
+        // Native proxy setup suspends; preserve settings written meanwhile.
+        var mine = Extensions.settings(for: id)
         switch parts[0] {
         case "setting.set":
             mine[name] = details["value"]

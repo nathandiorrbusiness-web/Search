@@ -164,10 +164,12 @@ struct ExtensionsPage: View {
                         .help(item.source ?? "")
                 }
                 Spacer(minLength: 8)
-                if hovering {
+                if hovering || item.id == NordProxy.extensionID {
                     Quick(item.pinned == true ? "Unpin" : "Pin to Toolbar") {
                         extensions.setPinned(item.id, !(item.pinned ?? false))
                     }
+                }
+                if hovering {
                     if context?.overrideNewTabPageURL != nil {
                         let on = Store.settings.object(forKey: "extensions.newtab.\(item.id)") as? Bool == true
                         Quick(on ? "Stop in New Tabs" : "Show in New Tabs") {

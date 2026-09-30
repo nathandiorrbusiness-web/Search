@@ -26,6 +26,8 @@ This adapter is intentionally bound to Nord 6.1.1. General extension compatibili
 
 The native credential channel is available only to the authorized Nord context with proxy and webRequest permissions. Per-request unpredictable tokens bind replies to pending requests; no website runtime channel carries credentials. The loopback listener uses a random per-listener credential, caps connections and headers, bounds establishment and stops obsolete tunnels. Credentials are never written by this adapter.
 
+Synthetic authentication IDs describe relay connections, not individual encrypted website requests. Nord's pending-auth cleanup receives completion only after clean EOF in both directions, or failure when the connection aborts. The relay cannot inspect individual TLS requests. Nord's pin control remains visible in Settings so keyboard and Computer Use access do not depend on mouse hovering.
+
 ## Verification and remaining live acceptance
 
 Standalone checks compile the production proxy, PAC, relay and JavaScript authentication bridge, exercising actual normal/private WebKit traffic against an authenticated local CONNECT fixture. The installed Command Line Tools lack XCTest, so swift test cannot run here. Live acceptance still requires Nord sign-in, changed public IP in two independent checks, country change, Disconnect, private tabs, restart and other browsers remaining direct. Ad-hoc signing supports this Mac; distributable signing/notarization is separate.

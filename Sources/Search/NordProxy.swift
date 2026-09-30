@@ -249,7 +249,7 @@ struct NordRoute: Sendable {
         // kCFProxyTypeHTTPS means a plaintext PROXY for an HTTPS destination.
         // Preserve TLS selection using SOCKS as an internal result marker;
         // actual SOCKS and multi-route answers are refused by this wrapper.
-        let wrapped = script + #"""
+        let wrapped = script + "\n" + #"""
         ;var __searchFindProxyForURL = FindProxyForURL;
         FindProxyForURL = function(url, host) {
             var route = __searchFindProxyForURL(url, host);
@@ -370,6 +370,7 @@ final class NordRelay {
         var finishedDirections = 0
         var work: Task<Void, Never>?
         var onEnd: (() -> Void)?
+        var onCompletion: (String, String, String?) -> Void = { NordProxy.shared.completed($0, url: $1, error: $2) }
         var requestID: String?
         var destination = ""
         init(client: NWConnection, script: String, localSecret: String, auth: @escaping (String, UInt16, String) async throws -> [String: String]) {
@@ -435,7 +436,6 @@ final class NordRelay {
                             switch state {
                             case .ready:
                                 self.ready = true
-                                self.report()
                                 self.client.send(content: Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8), completion: .contentProcessed { [weak self] error in
                                     MainActor.assumeIsolated {
                                         guard let self, error == nil else { self?.end(); return }
@@ -467,7 +467,7 @@ final class NordRelay {
                             guard let self, !self.ended, error == nil else { self?.end(); return }
                             if complete {
                                 self.finishedDirections += 1
-                                if self.finishedDirections == 2 { self.end() }
+                                if self.finishedDirections == 2 { self.end(error: nil) }
                             } else { self.pipe(source, to: target) }
                         }
                     })
@@ -481,11 +481,11 @@ final class NordRelay {
             client.send(content: Data("HTTP/1.1 \(status) \(name)\r\n\(auth)Content-Length: 0\r\nConnection: close\r\n\r\n".utf8), completion: .contentProcessed { [weak self] _ in MainActor.assumeIsolated { self?.end() } })
         }
         func report(error: String? = nil) {
-            if let requestID { NordProxy.shared.completed(requestID, url: destination, error: error); self.requestID = nil }
+            if let requestID { onCompletion(requestID, destination, error); self.requestID = nil }
         }
-        func end() {
+        func end(error: String? = "net::ERR_ABORTED") {
             guard !ended else { return }; ended = true
-            report(error: "net::ERR_ABORTED")
+            report(error: error)
             work?.cancel(); client.cancel(); upstream?.cancel(); onEnd?()
         }
     }
