@@ -28,6 +28,8 @@ The native credential channel is available only to the authorized Nord context w
 
 Synthetic authentication IDs describe relay connections, not individual encrypted website requests. Nord's pending-auth cleanup receives completion only after clean EOF in both directions, or failure when the connection aborts. The relay cannot inspect individual TLS requests. Nord's pin control remains visible in Settings so keyboard and Computer Use access do not depend on mouse hovering.
 
+Popup anchors are owned by each browser rather than one global extension ID. Toolbar and menu presses retain their originating browser for active-tab selection, delayed action callbacks, popup placement and tabs opened from the popup. A click in another window moves the popup there instead of only dismissing the prior window's popup. Closed browsers and unloaded extensions release their pending action ownership.
+
 ## Verification and remaining live acceptance
 
 Standalone checks compile the production proxy, PAC, relay and JavaScript authentication bridge, exercising actual normal/private WebKit traffic against an authenticated local CONNECT fixture. The installed Command Line Tools lack XCTest, so swift test cannot run here. Live acceptance still requires Nord sign-in, changed public IP in two independent checks, country change, Disconnect, private tabs, restart and other browsers remaining direct. Ad-hoc signing supports this Mac; distributable signing/notarization is separate.
