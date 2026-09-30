@@ -28,7 +28,7 @@ The native credential channel is available only to the authorized Nord context w
 
 Synthetic authentication IDs describe relay connections, not individual encrypted website requests. Nord's pending-auth cleanup receives completion only after clean EOF in both directions, or failure when the connection aborts. The relay cannot inspect individual TLS requests. Nord's pin control remains visible in Settings so keyboard and Computer Use access do not depend on mouse hovering.
 
-Popup anchors are owned by each browser rather than one global extension ID. Toolbar and menu presses retain their originating browser for active-tab selection, delayed action callbacks, popup placement and tabs opened from the popup. A click in another window moves the popup there instead of only dismissing the prior window's popup. Closed browsers and unloaded extensions release their pending action ownership.
+Popup anchors are owned by each browser rather than one global extension ID. Toolbar and menu presses retain their originating browser for active-tab selection, popup placement and tabs opened from the popup. Delayed WebKit action callbacks resolve their associated tab's current browser and reject closed tabs, unloaded contexts and default actions without a tab; there is no shared pending-action slot or fallback to another window. A click in another window moves the popup there instead of only dismissing the prior window's popup. Media prompts belong to the originating browser and requests from an obsolete popup are denied.
 
 ## Verification and remaining live acceptance
 

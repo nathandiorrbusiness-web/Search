@@ -95,7 +95,6 @@ final class Extensions: NSObject, ObservableObject {
     }
     /// Where each extension's button is on screen, for its popup to hang from.
     var anchors: [ObjectIdentifier: [String: WeakView]] = [:]
-    private var actionSources: [String: ExtensionWindow] = [:]
 
     static var folder: URL { Store.folder.appendingPathComponent("Extensions", isDirectory: true) }
 
@@ -336,7 +335,6 @@ final class Extensions: NSObject, ObservableObject {
     func detach(_ browser: Browser) {
         let key = ObjectIdentifier(browser)
         anchors[key] = nil
-        actionSources = actionSources.filter { $0.value.browser !== browser }
         guard following.removeValue(forKey: key) != nil else { return }
         for id in orders.removeValue(forKey: key) ?? [] {
             if let adapter = adapters[id] { controller.didCloseTab(adapter, windowIsClosing: true) }
@@ -474,7 +472,6 @@ final class Extensions: NSObject, ObservableObject {
     }
 
     private func unload(_ id: String) {
-        actionSources[id] = nil
         if id == NordProxy.extensionID { NordProxy.shared.stop() }
         guard let context = contexts[id] else { return }
         Browsers.closePopups(of: id)
@@ -1155,7 +1152,6 @@ final class Extensions: NSObject, ObservableObject {
             ExtensionPopup.shared.show(url, for: context, from: anchor(for: id, in: origin), in: origin)
             return
         }
-        actionSources[id] = window(of: origin)
         context.performAction(for: tab)
     }
 
@@ -1344,7 +1340,12 @@ extension Extensions: WKWebExtensionControllerDelegate {
     func webExtensionController(_ controller: WKWebExtensionController, presentActionPopup action: WKWebExtension.Action, for context: WKWebExtensionContext) async throws {
         let url = action.popupWebView?.url ?? Extensions.popupURL(for: context)
         action.closePopup()
-        guard let url, let origin = actionSources.removeValue(forKey: context.uniqueIdentifier)?.browser ?? browser, origin.isOpen else { return }
+        // A loaded callback can arrive after another window's press or the
+        // source window's close. Only WebKit's associated tab identifies it;
+        // a default action without a tab cannot safely choose a window.
+        guard contexts[context.uniqueIdentifier] === context, let url,
+              let adapter = action.associatedTab as? ExtensionTab, let tab = adapter.tab,
+              let origin = browser(of: tab), origin.isOpen else { return }
         ExtensionPopup.shared.show(url, for: context, from: anchor(for: context.uniqueIdentifier, in: origin), in: origin)
     }
 
