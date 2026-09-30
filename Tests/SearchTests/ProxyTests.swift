@@ -31,7 +31,7 @@ final class ProxyTests: XCTestCase {
         let privateStore = WKWebsiteDataStore.nonPersistent()
         proxy.attach(ordinary)
         proxy.attach(privateStore)
-        for mode in [ProxySettingsValue.Mode.http, .socks5] {
+        for mode in [ProxySettingsValue.Mode.http, .https, .socks5] {
             let value = ProxySettingsValue(mode: mode, host: "127.0.0.1", port: "7890", username: "test")
             try proxy.save(value, password: "secret")
             XCTAssertEqual(ordinary.proxyConfigurations.count, 1)

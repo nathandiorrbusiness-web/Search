@@ -914,3 +914,53 @@ private struct NotificationSites: View {
         }
     }
 }
+
+struct ProxySettings: View {
+    @ObservedObject private var proxy = BrowserProxy.shared
+    @State private var draft = BrowserProxy.shared.value
+    @State private var password = BrowserProxy.shared.savedPassword
+    @State private var message: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Line("Browser proxy", "Used by all spaces and private tabs") {
+                Picker("Proxy", selection: $draft.mode) {
+                    ForEach(ProxySettingsValue.Mode.allCases) { Text($0.title).tag($0) }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+            }
+            Rule()
+            if draft.mode != .system {
+                TextField("Host (e.g. 127.0.0.1)", text: $draft.host)
+                TextField("Port (e.g. 7890)", text: $draft.port)
+                TextField("Username (optional)", text: $draft.username)
+                SecureField("Password (optional)", text: $password)
+                Text("Passwords are saved in Keychain. HTTP and HTTPS use CONNECT. HTTPS also encrypts the connection to the proxy.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Palette.muted)
+            } else {
+                Text("No Search proxy override. WebKit uses the Mac's system network settings.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Palette.muted)
+            }
+            Text("Apply closes current browsing connections and updates existing and new tabs. Reload pages to use the new proxy.")
+                .font(.system(size: 12))
+                .foregroundStyle(Palette.muted)
+            if let validation = draft.validation {
+                Text(validation).font(.system(size: 12)).foregroundStyle(Palette.muted)
+            }
+            HStack {
+                Pill("Apply", filled: true) {
+                    do {
+                        try proxy.save(draft, password: password)
+                        message = "Proxy settings applied"
+                    } catch { message = error.localizedDescription }
+                }
+                .disabled(draft.validation != nil)
+                if let message { Text(message).font(.system(size: 12)).foregroundStyle(Palette.muted) }
+            }
+        }
+        .textFieldStyle(.roundedBorder)
+    }
+}

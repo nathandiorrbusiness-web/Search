@@ -1,16 +1,18 @@
 import Network
 import Security
-import SwiftUI
+import Combine
+import Foundation
 import WebKit
 
 struct ProxySettingsValue: Codable, Equatable {
     enum Mode: String, Codable, CaseIterable, Identifiable {
-        case system, http, socks5
+        case system, http, https, socks5
         var id: String { rawValue }
         var title: String {
             switch self {
             case .system: return "Disabled / System"
             case .http: return "HTTP"
+            case .https: return "HTTPS"
             case .socks5: return "SOCKS5"
             }
         }
@@ -39,8 +41,12 @@ struct ProxySettingsValue: Codable, Equatable {
         let endpoint = NWEndpoint.hostPort(
             host: .init(host.trimmingCharacters(in: .whitespacesAndNewlines)),
             port: .init(rawValue: number)!)
-        var proxy = mode == .http ? ProxyConfiguration(httpCONNECTProxy: endpoint)
-            : ProxyConfiguration(socksv5Proxy: endpoint)
+        var proxy: ProxyConfiguration
+        switch mode {
+        case .socks5: proxy = ProxyConfiguration(socksv5Proxy: endpoint)
+        case .https: proxy = ProxyConfiguration(httpCONNECTProxy: endpoint, tlsOptions: .init())
+        default: proxy = ProxyConfiguration(httpCONNECTProxy: endpoint)
+        }
         // A failed explicit proxy must not silently send traffic directly.
         proxy.allowFailover = false
         if !username.isEmpty { proxy.applyCredential(username: username, password: password) }
@@ -53,6 +59,7 @@ struct ProxySettingsValue: Codable, Equatable {
 final class BrowserProxy: ObservableObject {
     static let shared = BrowserProxy()
     @Published private(set) var value: ProxySettingsValue
+    private var override: ProxyConfiguration?
     private var password: String
     private let defaults: UserDefaults
     private let savePassword: (String) throws -> Void
@@ -66,15 +73,45 @@ final class BrowserProxy: ObservableObject {
         value = defaults.data(forKey: Self.key)
             .flatMap { try? JSONDecoder().decode(ProxySettingsValue.self, from: $0) } ?? .init()
         self.password = password ?? ProxySecret.read()
+        // Visible launch can restore a page before extension workers are ready.
+        // A persisted connected Nord profile starts blocked until its relay exists.
+        if #available(macOS 15.4, *), defaults === Store.settings,
+           Extensions.rememberedNordIsEnabled,
+           (Extensions.settings(for: NordProxy.extensionID)["proxy.settings"] as? [String: Any])?["mode"] as? String == "pac_script" {
+            var blocked = ProxyConfiguration(httpCONNECTProxy: .hostPort(host: "127.0.0.1", port: 9))
+            blocked.allowFailover = false
+            override = blocked
+        }
     }
 
     func attach(_ store: WKWebsiteDataStore) {
         guard !stores.contains(store) else { return }
         stores.add(store)
-        store.proxyConfigurations = value.configurations(password: password)
+        store.proxyConfigurations = override.map { [$0] } ?? value.configurations(password: password)
+    }
+
+    func extensionOverride(_ configuration: ProxyConfiguration?) {
+        if configuration == nil && override == nil { return }
+        override = configuration
+        apply()
+    }
+
+    private func apply() {
+        for store in stores.allObjects {
+            store.proxyConfigurations = override.map { [$0] } ?? value.configurations(password: password)
+        }
+        // Otherwise CFNetwork can reuse a direct keep-alive connection after
+        // the proxy changes. This terminates only this app's network process.
+        if let store = stores.allObjects.first {
+            let close = NSSelectorFromString("_terminateNetworkProcess")
+            if store.responds(to: close) { store.perform(close) }
+        }
     }
 
     func save(_ proposed: ProxySettingsValue, password: String) throws {
+        guard override == nil else {
+            throw NSError(domain: "SearchProxy", code: 2, userInfo: [NSLocalizedDescriptionKey: "NordVPN is controlling browsing routes. Disable the Nord extension before changing the manual proxy."])
+        }
         if let message = proposed.validation {
             throw NSError(domain: "SearchProxy", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
         }
@@ -84,9 +121,7 @@ final class BrowserProxy: ObservableObject {
         defaults.set(data, forKey: Self.key)
         self.password = password
         value = proposed
-        for store in stores.allObjects {
-            store.proxyConfigurations = value.configurations(password: password)
-        }
+        apply()
     }
 
     var savedPassword: String { password }
@@ -127,55 +162,5 @@ private enum ProxySecret {
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(status),
                           userInfo: [NSLocalizedDescriptionKey: "Could not save the proxy password in Keychain (\(status))."])
         }
-    }
-}
-
-struct ProxySettings: View {
-    @ObservedObject private var proxy = BrowserProxy.shared
-    @State private var draft = BrowserProxy.shared.value
-    @State private var password = BrowserProxy.shared.savedPassword
-    @State private var message: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Line("Browser proxy", "Used by all spaces and private tabs") {
-                Picker("Proxy", selection: $draft.mode) {
-                    ForEach(ProxySettingsValue.Mode.allCases) { Text($0.title).tag($0) }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-            }
-            Rule()
-            if draft.mode != .system {
-                TextField("Host (e.g. 127.0.0.1)", text: $draft.host)
-                TextField("Port (e.g. 7890)", text: $draft.port)
-                TextField("Username (optional)", text: $draft.username)
-                SecureField("Password (optional)", text: $password)
-                Text("Passwords are saved in Keychain. HTTP uses CONNECT; the proxy must support tunneling.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Palette.muted)
-            } else {
-                Text("No Search proxy override. WebKit uses the Mac's system network settings.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Palette.muted)
-            }
-            Text("Apply updates existing and new tabs without restarting. Reload pages to request them through the new proxy; transfers already in progress may finish on their current connection.")
-                .font(.system(size: 12))
-                .foregroundStyle(Palette.muted)
-            if let validation = draft.validation {
-                Text(validation).font(.system(size: 12)).foregroundStyle(Palette.muted)
-            }
-            HStack {
-                Pill("Apply", filled: true) {
-                    do {
-                        try proxy.save(draft, password: password)
-                        message = "Proxy settings applied"
-                    } catch { message = error.localizedDescription }
-                }
-                .disabled(draft.validation != nil)
-                if let message { Text(message).font(.system(size: 12)).foregroundStyle(Palette.muted) }
-            }
-        }
-        .textFieldStyle(.roundedBorder)
     }
 }

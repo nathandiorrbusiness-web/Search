@@ -113,6 +113,10 @@ final class Extensions: NSObject, ObservableObject {
         return parts.url ?? url
     }
     private static var list: URL { folder.appendingPathComponent("installed.json") }
+    static var rememberedNordIsEnabled: Bool {
+        let saved = (try? JSONDecoder().decode([Installed].self, from: Data(contentsOf: list))) ?? []
+        return saved.contains { $0.id == NordProxy.extensionID && $0.enabled }
+    }
     static func folder(for id: String) -> URL { folder.appendingPathComponent(id, isDirectory: true) }
     private static func stagingFolder(for id: String) -> URL {
         folder.appendingPathComponent(".staging-\(id)-\(UUID().uuidString)", isDirectory: true)
@@ -447,6 +451,10 @@ final class Extensions: NSObject, ObservableObject {
             }
             Extensions.fence(context)
             Extensions.watchTouches()
+            if item.id == NordProxy.extensionID, !installed.contains(where: { $0.id == item.id && $0.enabled }) { return false }
+            // Prepare Nord's stable browsing relay before its worker starts.
+            await NordProxy.shared.restore(context)
+            if item.id == NordProxy.extensionID, !installed.contains(where: { $0.id == item.id && $0.enabled }) { NordProxy.shared.stop(); return false }
             try controller.load(context)
             watch(context)
             if contexts[item.id] == nil, loadsThisRun.contains(item.id) { loadedBefore.insert(item.id) }
@@ -463,6 +471,7 @@ final class Extensions: NSObject, ObservableObject {
     }
 
     private func unload(_ id: String) {
+        if id == NordProxy.extensionID { NordProxy.shared.stop() }
         guard let context = contexts[id] else { return }
         Browsers.closePopups(of: id)
         try? controller.unload(context)
@@ -1356,6 +1365,10 @@ extension Extensions: WKWebExtensionControllerDelegate {
     }
 
     func webExtensionController(_ controller: WKWebExtensionController, connectUsing port: WKWebExtension.MessagePort, for extensionContext: WKWebExtensionContext) async throws {
+        if port.applicationIdentifier == NordProxy.application {
+            try NordProxy.shared.connect(port, context: extensionContext)
+            return
+        }
         if port.applicationIdentifier == ExtensionSocket.name {
             ExtensionSocket.connect(port, from: extensionContext.uniqueIdentifier)
             return
