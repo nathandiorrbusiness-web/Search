@@ -1135,7 +1135,8 @@ final class Extensions: NSObject, ObservableObject {
     }
 
     func press(_ id: String, in source: Browser? = nil) {
-        guard let origin = source ?? browser, origin.isOpen, let context = contexts[id], !ExtensionPopup.shared.closes(id, in: origin) else { return }
+        guard let origin = source ?? browser, origin.isOpen, let context = contexts[id] else { return }
+        guard !ExtensionPopup.shared.closes(id, in: origin) else { return }
         let tab = activeAdapter(of: origin)
         Extensions.clicked[id] = Date()
         Extensions.pressed[id] = Date()
@@ -1335,18 +1336,14 @@ extension Extensions: WKWebExtensionControllerDelegate {
         actionsChanged += 1
     }
 
-    /// The popup page, in a popover of the browser's own (ExtensionPopup
-    /// says why): WebKit's view is only asked which page it would show.
+    /// Native toolbar/menu presses render the popup directly in `press`.
     func webExtensionController(_ controller: WKWebExtensionController, presentActionPopup action: WKWebExtension.Action, for context: WKWebExtensionContext) async throws {
-        let url = action.popupWebView?.url ?? Extensions.popupURL(for: context)
         action.closePopup()
-        // A loaded callback can arrive after another window's press or the
-        // source window's close. Only WebKit's associated tab identifies it;
-        // a default action without a tab cannot safely choose a window.
-        guard contexts[context.uniqueIdentifier] === context, let url,
-              let adapter = action.associatedTab as? ExtensionTab, let tab = adapter.tab,
-              let origin = browser(of: tab), origin.isOpen else { return }
-        ExtensionPopup.shared.show(url, for: context, from: anchor(for: context.uniqueIdentifier, in: origin), in: origin)
+        // WebKit gives no invocation token or ordering guarantee for a
+        // loaded popup callback. Guessing its intent can replace a newer
+        // window's popup; dropping script-only requests costs automatic
+        // presentation but preserves the user's native button controls.
+        throw ExtensionNative.Refused(why: "Open the extension using its toolbar or menu button.")
     }
 
     /// `runtime.sendNativeMessage`. To "search" — the APIs WebKit doesn't
