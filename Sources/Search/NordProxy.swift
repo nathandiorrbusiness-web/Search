@@ -79,10 +79,26 @@ final class NordProxy {
     private var waiting: [String: CheckedContinuation<[String: String], Error>] = [:]
     private var generation = UUID()
     private var transition = UUID()
+    private var checkpoints: [String] = []
+    var diagnostics: [String: Any] {
+        ["checkpoints": checkpoints, "relay": relay != nil, "peer": peer?.isDisconnected == false,
+         "pendingAuthentication": waiting.count]
+    }
+    private func note(_ checkpoint: String) {
+        checkpoints.append(checkpoint)
+        checkpoints = Array(checkpoints.suffix(40))
+    }
 
     func set(_ value: [String: Any], context: WKWebExtensionContext) async throws {
         let operation = UUID(); transition = operation
-        try await apply(value, context: context, operation: operation)
+        note("settings-start")
+        do {
+            try await apply(value, context: context, operation: operation)
+            note("settings-applied")
+        } catch {
+            note("settings-failed")
+            throw error
+        }
     }
 
     private func apply(_ value: [String: Any], context: WKWebExtensionContext, operation: UUID) async throws {
@@ -112,8 +128,17 @@ final class NordProxy {
         }
         let made = try await NordRelay.start(script: script) { [weak self] host, port, destination in
             guard let self else { throw failure("Nord proxy controller closed.") }
-            return try await self.credentials(host: host, port: port, destination: destination)
+            self.note("auth-request")
+            do {
+                let credentials = try await self.credentials(host: host, port: port, destination: destination)
+                self.note("auth-answered")
+                return credentials
+            } catch {
+                self.note("auth-failed")
+                throw error
+            }
         }
+        made.onDiagnostic = { [weak self] checkpoint in self?.note(checkpoint) }
         guard transition == operation else { made.stop(); throw CancellationError() }
         made.onFailure = { [weak self, weak made] error in
             guard let self, let made, self.relay === made else { return }
@@ -157,6 +182,7 @@ final class NordProxy {
             throw failure("Only Nord's authorized background may use the Nord proxy port.")
         }
         if peer != nil || !waiting.isEmpty { cancelPending() }
+        note("peer-connected")
         peer?.disconnect(); peer = port
         port.messageHandler = { [weak self, weak port] message, _ in
             MainActor.assumeIsolated {
@@ -299,6 +325,7 @@ final class NordRelay {
     private var connections: [UUID: Tunnel] = [:]
     private var starting: CheckedContinuation<Void, Error>?
     var onFailure: ((Error) -> Void)?
+    var onDiagnostic: (String) -> Void = { _ in }
     var configuration: ProxyConfiguration {
         var made = ProxyConfiguration(httpCONNECTProxy: .hostPort(host: "127.0.0.1", port: listener.port!))
         made.allowFailover = false
@@ -333,6 +360,7 @@ final class NordRelay {
                     let tunnel = Tunnel(client: connection, script: made.script, localSecret: made.localSecret, auth: made.auth)
                     made.connections[id] = tunnel
                     tunnel.onEnd = { [weak made] in made?.connections[id] = nil }
+                    tunnel.onDiagnostic = { [weak made] checkpoint in made?.onDiagnostic(checkpoint) }
                     tunnel.start()
                 }
             }
@@ -370,6 +398,7 @@ final class NordRelay {
         var finishedDirections = 0
         var work: Task<Void, Never>?
         var onEnd: (() -> Void)?
+        var onDiagnostic: (String) -> Void = { _ in }
         var onCompletion: (String, String, String?) -> Void = { NordProxy.shared.completed($0, url: $1, error: $2) }
         var requestID: String?
         var destination = ""
@@ -381,7 +410,7 @@ final class NordRelay {
             readHeader()
             Task { [weak self] in
                 try? await Task.sleep(for: .seconds(20))
-                if self?.ready == false { self?.report(error: "net::ERR_PROXY_CONNECTION_FAILED"); self?.end() }
+                if self?.ready == false { self?.onDiagnostic("tunnel-timeout"); self?.report(error: "net::ERR_PROXY_CONNECTION_FAILED"); self?.end() }
             }
         }
         func readHeader() {
@@ -410,12 +439,14 @@ final class NordRelay {
                 return bits.count == 2 && bits[0].lowercased() == "proxy-authorization" ? bits[1].trimmingCharacters(in: .whitespaces) : nil
             }
             guard credentials.count == 1, credentials[0] == expected else { reply(407); return }
+            onDiagnostic("tunnel-received")
             destination = "\(port == 80 ? "http" : "https")://\(first[1])/"
             work = Task { [weak self] in
                 guard let self else { return }
                 do {
                     let script = self.script
                     let route = try await Task.detached { try NordRoute.evaluate(script, host: host, port: port) }.value
+                    self.onDiagnostic(route.kind == .direct ? "route-direct" : route.kind == .blocked ? "route-blocked" : "route-proxy")
                     try Task.checkCancellation()
                     guard route.kind != .blocked else { throw failure("Nord kill switch blocked this destination.") }
                     let parameters = NWParameters.tcp
@@ -435,6 +466,7 @@ final class NordRelay {
                             guard let self, !self.ended else { return }
                             switch state {
                             case .ready:
+                                self.onDiagnostic("upstream-ready")
                                 self.ready = true
                                 self.client.send(content: Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8), completion: .contentProcessed { [weak self] error in
                                     MainActor.assumeIsolated {
@@ -448,14 +480,14 @@ final class NordRelay {
                                         }) }
                                     }
                                 })
-                            case .failed: self.report(error: "net::ERR_PROXY_CONNECTION_FAILED"); self.reply(502)
+                            case .failed: self.onDiagnostic("upstream-failed"); self.report(error: "net::ERR_PROXY_CONNECTION_FAILED"); self.reply(502)
                             case .cancelled: self.end()
                             default: break
                             }
                         }
                     }
                     connection.start(queue: .main)
-                } catch { self.report(error: "net::ERR_PROXY_CONNECTION_FAILED"); self.reply(502) }
+                } catch { self.onDiagnostic("tunnel-failed"); self.report(error: "net::ERR_PROXY_CONNECTION_FAILED"); self.reply(502) }
             }
         }
         func pipe(_ source: NWConnection, to target: NWConnection) {

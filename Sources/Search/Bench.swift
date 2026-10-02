@@ -2756,6 +2756,7 @@ final class Bench {
                     "reported": extensions.errors[item.id] ?? [],
                     "action": action?.label ?? "", "badge": action?.badgeText ?? "",
                     "popup": action?.presentsPopup ?? false,
+                    "nordProxy": item.id == NordProxy.extensionID ? NordProxy.shared.diagnostics : [:],
                     "pinned": item.pinned ?? false, "source": item.source ?? "",
                 ]
             }])
