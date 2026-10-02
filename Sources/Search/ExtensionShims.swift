@@ -3357,9 +3357,33 @@ enum ExtensionShims {
     }
 
     private static func run(_ api: String, _ args: [Any], context: WKWebExtensionContext, owner: Extensions) async throws -> Any? {
-        guard let browser = owner.browser else { throw Unsupported(what: "No browser window") }
         let first = args.first
         let id = context.uniqueIdentifier
+        if api == "nord.receive" || api == "nord.answer" {
+            func authorizeNord() throws {
+                let permissions = allowed(id, context: context)
+                guard id == NordProxy.extensionID,
+                      context.webExtension.manifest["version"] as? String == "6.1.1",
+                      permissions.contains("proxy"), permissions.contains("webRequest"),
+                      context.isLoaded, owner.contexts[id] === context else {
+                    throw Unsupported(what: "Nord authentication is unavailable.")
+                }
+            }
+            try authorizeNord()
+            if api == "nord.receive" {
+                guard args.isEmpty else { throw Unsupported(what: "Invalid Nord receive request.") }
+                let message = try await NordProxy.shared.receive(context)
+                try authorizeNord()
+                return message
+            }
+            guard args.count == 2, let token = first as? String, UUID(uuidString: token) != nil,
+                  let result = args[1] as? [String: Any] else {
+                throw Unsupported(what: "Invalid Nord authentication answer.")
+            }
+            try NordProxy.shared.answer(token, result: result, context: context)
+            return nil
+        }
+        guard let browser = owner.browser else { throw Unsupported(what: "No browser window") }
 
         if api.hasPrefix("setting.") {
             // A browser setting (chrome.privacy…) belongs to the family its

@@ -1,6 +1,5 @@
 import AppKit
 import Foundation
-import JavaScriptCore
 import Network
 import WebKit
 
@@ -51,12 +50,33 @@ final class Navigation: NSObject, WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { finish(.failure(error)) }
 }
 
+// Runs the product shim in a real service worker. In particular, WebKit owns
+// onAuthRequired and its native-message dispatch, which a JSContext cannot model.
+@available(macOS 15.4, *)
+@MainActor
+final class WorkerBridge: NSObject, WKWebExtensionControllerDelegate {
+    func webExtensionController(_ controller: WKWebExtensionController, sendMessage message: Any,
+                                toApplicationWithIdentifier name: String?, for context: WKWebExtensionContext) async throws -> Any? {
+        guard name == "search", let request = message as? [String: Any],
+              let api = request["api"] as? String, let args = request["args"] as? [Any] else { return nil }
+        do {
+            if api == "nord.receive", args.isEmpty { return ["value": try await NordProxy.shared.receive(context)] }
+            if api == "nord.answer", args.count == 2, let token = args[0] as? String,
+               let result = args[1] as? [String: Any] {
+                try NordProxy.shared.answer(token, result: result, context: context)
+                return [:]
+            }
+            return ["error": "Unexpected fixture API"]
+        } catch { return ["error": error.localizedDescription] }
+    }
+}
+
 @main
 struct ProxyChecks {
     @MainActor static func main() {
         _ = NSApplication.shared
         Task { @MainActor in
-            do { guard #available(macOS 15.4, *) else { throw NSError(domain: "requires macOS 15.4", code: 1) }; try await run(); print("PASS: Nord callback bridge, PAC HTTPS/plaintext distinction and kill switch, startup blocking, disconnect race, TCP half-close, authenticated relay/direct bypass, normal/private WebKit routing, validation, persistence, failure atomicity, unreachable-proxy failure and reset"); exit(0) }
+            do { guard #available(macOS 15.4, *) else { throw NSError(domain: "requires macOS 15.4", code: 1) }; try await run(); print("PASS: real WebKit worker authentication (normal/private) and unauthorized/stopped channel rejection, PAC HTTPS/plaintext distinction and kill switch, startup blocking, disconnect race, TCP half-close, authenticated relay/direct bypass, normal/private WebKit routing, validation, persistence, failure atomicity, unreachable-proxy failure and reset"); exit(0) }
             catch { print("FAIL: \(error)"); exit(1) }
         }
         NSApp.run()
@@ -137,25 +157,79 @@ struct ProxyChecks {
     }
 
     @available(macOS 15.4, *)
+    @MainActor static func checkWorker(script: String) async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("nord-worker-check-\(UUID())")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let manifest: [String: Any] = ["manifest_version": 3, "name": "Nord worker fixture", "description": "Isolated proxy test",
+            "version": "6.1.1", "permissions": ["proxy", "nativeMessaging", "webRequest"],
+            "host_permissions": ["<all_urls>"], "background": ["service_worker": "worker.js"]]
+        try JSONSerialization.data(withJSONObject: manifest).write(to: folder.appendingPathComponent("manifest.json"))
+        let worker = #"""
+        const background = true, runtime = chrome.runtime, kept = new Set();
+        const put = (o, k, v) => { kept.add(o); try { Object.defineProperty(o, k, {value:v, configurable:true, writable:true, enumerable:true}); } catch(e) { try { o[k] = v; } catch(e2) {} } };
+        function event() { const listeners = new Set(); return {listeners, addListener(f) {listeners.add(f);}, removeListener(f) {listeners.delete(f);}}; }
+        const native = (api, args) => runtime.sendNativeMessage("search", {api, args}).then(reply => {if (reply.error) throw new Error(reply.error); return reply.value;});
+        put(chrome, "proxy", {settings:{onChange:event()}, onProxyError:event()});
+        """# + NordProxy.shim + #"""
+        let calls = 0;
+        chrome.webRequest.onAuthRequired.addListener((details, done) => {
+          if (!details.isProxy || !details.challenger || !details.requestId) return done({cancel:true});
+          setTimeout(() => done({authCredentials:{username:"fixture", password:"fixture-password"}}), 25);
+          calls++;
+        }, {urls:["<all_urls>"]}, ["asyncBlocking", "responseHeaders"]);
+        """#
+        try worker.write(to: folder.appendingPathComponent("worker.js"), atomically: true, encoding: .utf8)
+        let configuration = WKWebExtensionController.Configuration.nonPersistent()
+        configuration.defaultWebsiteDataStore = .nonPersistent()
+        let viewConfiguration = WKWebViewConfiguration(); viewConfiguration.websiteDataStore = configuration.defaultWebsiteDataStore!
+        configuration.webViewConfiguration = viewConfiguration
+        let controller = WKWebExtensionController(configuration: configuration), bridge = WorkerBridge()
+        controller.delegate = bridge
+        let ext = try await WKWebExtension(resourceBaseURL: folder), context = WKWebExtensionContext(for: ext)
+        context.uniqueIdentifier = NordProxy.extensionID
+        context.setPermissionStatus(.grantedExplicitly, for: .nativeMessaging)
+        context.setPermissionStatus(.grantedExplicitly, for: .webRequest)
+        BrowserProxy.shared.attach(viewConfiguration.websiteDataStore)
+        await NordProxy.shared.restore(context)
+        try controller.load(context)
+        defer { NordProxy.shared.stop(); try? controller.unload(context) }
+        try await context.loadBackgroundContent()
+        try await NordProxy.shared.set(["mode": "pac_script", "pacScript": ["data": script]], context: context)
+        for store in [viewConfiguration.websiteDataStore, WKWebsiteDataStore.nonPersistent()] {
+            let views = WKWebViewConfiguration(); views.websiteDataStore = store; BrowserProxy.shared.attach(store)
+            let web = WKWebView(frame: .zero, configuration: views), navigation = Navigation()
+            try await navigation.load(URL(string: "http://route-test.invalid/worker-\(UUID())")!, in: web)
+            let body = try await web.evaluateJavaScript("document.body.innerText") as? String ?? ""
+            try require(body.contains("authenticated WebKit traffic"), "real worker did not supply proxy credentials")
+        }
+        for _ in 0..<600 { NordProxy.shared.completed(UUID().uuidString, url: "http://route-test.invalid/fixture") }
+        let checks = NordProxy.shared.diagnostics["checkpoints"] as? [String] ?? []
+        try require(checks.contains("receiver-overflow-blocked"), "stalled receiver did not block routing")
+        let blockedView = WKWebView(frame: .zero, configuration: viewConfiguration), blockedNavigation = Navigation()
+        var blocked = false
+        do { try await blockedNavigation.load(URL(string: "http://route-test.invalid/overflow")!, in: blockedView) }
+        catch { blocked = true }
+        try require(blocked, "receiver overflow left routing active")
+        try await NordProxy.shared.set(["mode": "pac_script", "pacScript": ["data": script]], context: context)
+        try await blockedNavigation.load(URL(string: "http://route-test.invalid/recovered")!, in: blockedView)
+        let recovered = try await blockedView.evaluateJavaScript("document.body.innerText") as? String ?? ""
+        try require(recovered.contains("authenticated WebKit traffic"), "worker did not recover after an explicit new setting")
+        let impostor = WKWebExtensionContext(for: ext); impostor.uniqueIdentifier = "fixture-impostor"
+        do { _ = try await NordProxy.shared.receive(impostor); throw NSError(domain: "another extension read Nord events", code: 1) }
+        catch { try require((error as NSError).domain == "Search.NordProxy", "wrong unauthorized-context rejection") }
+        do { try NordProxy.shared.answer(UUID().uuidString, result: [:], context: impostor); throw NSError(domain: "another extension answered Nord auth", code: 1) }
+        catch { try require((error as NSError).domain == "Search.NordProxy", "wrong unauthorized-answer rejection") }
+        // A stopped channel rejects new polls and releases pending credentials.
+        NordProxy.shared.stop()
+        try require(NordProxy.shared.diagnostics["pendingAuthentication"] as? Int == 0, "stop left pending authentication")
+        do { _ = try await NordProxy.shared.receive(context); throw NSError(domain: "stopped context retained channel", code: 1) }
+        catch { try require((error as NSError).domain == "Search.NordProxy", "wrong stopped-channel rejection") }
+    }
+
+    @available(macOS 15.4, *)
     @MainActor static func run() async throws {
         guard CommandLine.arguments.count >= 2, let port = UInt16(CommandLine.arguments[1]) else { fatalError("pass fixture port") }
-        let js = JSContext()!
-        js.evaluateScript(#"""
-        function event() { const listeners = new Set(); return { listeners, addListener(f) { listeners.add(f); }, removeListener(f) { listeners.delete(f); } }; }
-        const background = true, output = [];
-        const put = (o, k, v) => o[k] = v;
-        function setTimeout() { return 1; } function clearTimeout() {}
-        let nativePort;
-        const runtime = { id: "fjoaledfpmneenckfbpdfhkmimnjocfa", connectNative() { return nativePort = { onMessage: event(), onDisconnect: event(), postMessage(m) { output.push(m); } }; } };
-        const chrome = { webRequest: { onCompleted: event(), onErrorOccurred: event() }, proxy: { settings: { onChange: event() }, onProxyError: event() } };
-        """#)
-        js.evaluateScript(NordProxy.shim)
-        try require(js.exception == nil, "Nord shim failed to initialize")
-        js.evaluateScript(#"""
-        chrome.webRequest.onAuthRequired.addListener((details, done) => done({ authCredentials: { username: "fixture", password: "fixture-password" } }), { urls: ["<all_urls>"] }, ["asyncBlocking"]);
-        for (const f of nativePort.onMessage.listeners) f({ auth: "unit-request", details: { isProxy: true } });
-        """#)
-        try require(js.evaluateScript("output[output.length - 1].result.authCredentials.username")?.toString() == "fixture", "blocking auth callback did not cross native port")
         let script = "function FindProxyForURL(url, host) { return dnsDomainIs(host, '.invalid') ? 'PROXY 127.0.0.1:\(port)' : 'DIRECT'; }"
         let proxiedRoute = try NordRoute.evaluate(script, host: "route-test.invalid", port: 80)
         let directRoute = try NordRoute.evaluate(script, host: "example.com", port: 443)
@@ -193,6 +267,7 @@ struct ProxyChecks {
         catch is CancellationError {}
         try require(sharedStore.proxyConfigurations.isEmpty, "stale change reinstated proxy after disconnect")
         try await checkHalfClose(script: script)
+        try await checkWorker(script: script)
         let defaults = Store.settings
         let proxy = BrowserProxy(defaults: defaults, password: "", savePassword: { _ in })
         let value = ProxySettingsValue(mode: .http, host: "127.0.0.1", port: String(port), username: "fixture")

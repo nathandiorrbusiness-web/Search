@@ -5,22 +5,21 @@ import WebKit
 
 /// Nord 6.1.1 uses host-based PAC rules. A loopback CONNECT relay evaluates
 /// those rules per destination; WebKit's public proxy API cannot execute PAC.
-/// Credentials come only from the controlling extension over its native port.
+/// Credentials come only from the controlling extension over native messages.
 @available(macOS 15.4, *)
 @MainActor
 final class NordProxy {
     static let shared = NordProxy()
     static let extensionID = "fjoaledfpmneenckfbpdfhkmimnjocfa"
-    static let application = "search.nord-proxy"
     nonisolated static let shim = #"""
       // Nord's blocking authentication callback is answered over a browser-owned
-      // port. It never goes through website runtime messages or a global event.
+      // channel. It never goes through website runtime messages or a global event.
       if (background && runtime.id === "fjoaledfpmneenckfbpdfhkmimnjocfa") {
         const auth = new Map(), observations = { completed: new Map(), failed: new Map() };
         // This version's handlers use <all_urls>. Refuse other filters rather
         // than deliver synthetic events with broader reach than requested.
         const supported = (filter) => filter && Array.isArray(filter.urls) && filter.urls.length === 1 && filter.urls[0] === "<all_urls>" && Object.keys(filter).every(k => k === "urls");
-        const required = event();
+        const required = chrome.webRequest.onAuthRequired || event();
         put(required, "addListener", (listener, filter, options) => {
           if (!supported(filter)) throw new Error("Nord native auth requires an all-URLs filter");
           if (typeof listener === "function") auth.set(listener, { filter, options });
@@ -38,50 +37,53 @@ final class NordProxy {
           });
           put(ev, "removeListener", (listener) => { observations[key].delete(listener); return remove(listener); });
         }
-        let port, retry;
-        const connect = () => {
-          clearTimeout(retry);
-          try {
-            const current = runtime.connectNative("search.nord-proxy"); port = current;
-            current.onMessage.addListener((message) => {
-              if (!message || current !== port) return;
-              if (message.auth) {
-                const listener = auth.entries().next().value;
-                const finish = (result) => { try { current.postMessage({ answer: message.auth, result: result || {} }); } catch (e) {} };
-                if (!listener) return finish({ cancel: true });
-                let answered = false;
-                const done = (result) => { if (!answered) { answered = true; finish(result); } };
-                try {
-                  const result = listener[0](message.details, done);
-                  if (result && typeof result.then === "function") result.then(done, () => done({ cancel: true }));
-                  else if (result && typeof result === "object") done(result);
-                  else if (!(listener[1].options || []).includes("asyncBlocking")) done({});
-                } catch (e) { done({ cancel: true }); }
-              } else if (observations[message.event]) {
-                for (const listener of [...observations[message.event].keys()]) { try { listener(message.details); } catch (e) {} }
-              } else if (message.event === "changed") {
-                for (const listener of chrome.proxy.settings.onChange.listeners) { try { listener({ value: message.value, levelOfControl: "controlled_by_this_extension" }); } catch (e) {} }
-              } else if (message.event === "error") {
-                for (const listener of chrome.proxy.onProxyError.listeners) { try { listener(message.details); } catch (e) {} }
-              }
-            });
-            current.onDisconnect.addListener(() => { if (current === port) { port = null; retry = setTimeout(connect, 250); } });
-            const hello = () => { if (current === port) { try { current.postMessage({ hello: true }); } catch (e) {} } };
-            hello(); setTimeout(hello, 100); setTimeout(hello, 500);
-          } catch (e) { retry = setTimeout(connect, 1000); }
+        const handle = (message) => {
+          if (!message) return;
+          if (message.auth) {
+            const listener = auth.entries().next().value;
+            const finish = (result) => native("nord.answer", [message.auth, result || {}]).catch(() => {});
+            if (!listener) return finish({ cancel: true });
+            let answered = false;
+            const done = (result) => { if (!answered) { answered = true; finish(result); } };
+            try {
+              const result = listener[0](message.details, done);
+              if (result && typeof result.then === "function") result.then(done, () => done({ cancel: true }));
+              else if (result && typeof result === "object") done(result);
+              else if (!(listener[1].options || []).includes("asyncBlocking")) done({});
+            } catch (e) { done({ cancel: true }); }
+          } else if (observations[message.event]) {
+            for (const listener of [...observations[message.event].keys()]) { try { listener(message.details); } catch (e) {} }
+          } else if (message.event === "changed") {
+            for (const listener of chrome.proxy.settings.onChange.listeners) { try { listener({ value: message.value, levelOfControl: "controlled_by_this_extension" }); } catch (e) {} }
+          } else if (message.event === "error") {
+            for (const listener of chrome.proxy.onProxyError.listeners) { try { listener(message.details); } catch (e) {} }
+          }
         };
-        connect();
+        // WebKit workers do not reliably dispatch messages on native ports.
+        // Search's one-shot native calls also work during worker startup.
+        const receive = async () => {
+          for (;;) {
+            try {
+              const message = await native("nord.receive", []);
+              if (message && message.event === "stopped") return;
+              handle(message);
+            } catch (e) { await new Promise(resolve => setTimeout(resolve, 1000)); }
+          }
+        };
+        receive();
       }
     """#
     private var relay: NordRelay?
-    private var peer: WKWebExtension.MessagePort?
+    private var notifications: [[String: Any]] = []
+    private var receiver: (id: UUID, done: CheckedContinuation<[String: Any], Never>)?
+    private var lastReceive = Date.distantPast
     private weak var context: WKWebExtensionContext?
     private var waiting: [String: CheckedContinuation<[String: String], Error>] = [:]
     private var generation = UUID()
     private var transition = UUID()
     private var checkpoints: [String] = []
     var diagnostics: [String: Any] {
-        ["checkpoints": checkpoints, "relay": relay != nil, "peer": peer?.isDisconnected == false,
+        ["checkpoints": checkpoints, "relay": relay != nil, "receiver": Date().timeIntervalSince(lastReceive) < 3,
          "pendingAuthentication": waiting.count]
     }
     private func note(_ checkpoint: String) {
@@ -105,6 +107,13 @@ final class NordProxy {
         guard context.uniqueIdentifier == Self.extensionID,
               context.webExtension.manifest["version"] as? String == "6.1.1" else {
             throw failure("Proxy extensions require native support; this build supports NordVPN 6.1.1.")
+        }
+        if self.context !== context {
+            cancelPending()
+            let stopped = receiver?.done; receiver = nil
+            notifications.removeAll()
+            lastReceive = .distantPast
+            stopped?.resume(returning: ["event": "stopped"])
         }
         self.context = context
         let mode = value["mode"] as? String ?? "system"
@@ -169,59 +178,71 @@ final class NordProxy {
     func stop() {
         transition = UUID()
         context = nil
+        lastReceive = .distantPast
+        let stopped = receiver?.done; receiver = nil
+        notifications.removeAll()
+        stopped?.resume(returning: ["event": "stopped"])
         cancelPending()
         relay?.stop(); relay = nil
         BrowserProxy.shared.extensionOverride(nil)
         post(["event": "changed", "value": ["mode": "system"]])
     }
 
-    func connect(_ port: WKWebExtension.MessagePort, context: WKWebExtensionContext) throws {
-        guard context.uniqueIdentifier == Self.extensionID,
+    private func authorize(_ context: WKWebExtensionContext) throws {
+        guard context.uniqueIdentifier == Self.extensionID, context.isLoaded,
+              context.webExtension.manifest["version"] as? String == "6.1.1",
+              context === self.context,
               ExtensionShims.allowed(Self.extensionID, context: context).contains("proxy"),
               ExtensionShims.allowed(Self.extensionID, context: context).contains("webRequest") else {
-            throw failure("Only Nord's authorized background may use the Nord proxy port.")
+            throw failure("Only Nord's authorized context may use the Nord authentication channel.")
         }
-        if peer != nil || !waiting.isEmpty { cancelPending() }
-        note("peer-connected")
-        peer?.disconnect(); peer = port
-        port.messageHandler = { [weak self, weak port] message, _ in
-            MainActor.assumeIsolated {
-                guard let self, let port, self.peer === port, let data = message as? [String: Any] else { return }
-                if data["hello"] != nil || data["__searchNative"] as? String == "here?" {
-                    self.post(["ready": true, "__searchNative": "here"]); return
-                }
-                guard let token = data["answer"] as? String, let done = self.waiting.removeValue(forKey: token) else { return }
-                let response = data["result"] as? [String: Any]
-                guard response?["cancel"] as? Bool != true,
-                      let auth = response?["authCredentials"] as? [String: String],
-                      let username = auth["username"], let password = auth["password"],
-                      !username.isEmpty, !password.isEmpty else {
-                    done.resume(throwing: failure("Nord declined proxy authentication.")); return
-                }
-                done.resume(returning: ["username": username, "password": password, "requestID": token])
+    }
+
+    func receive(_ context: WKWebExtensionContext) async throws -> [String: Any] {
+        try authorize(context)
+        guard receiver == nil else { throw failure("Nord already has a pending receive.") }
+        lastReceive = Date()
+        if !notifications.isEmpty { return notifications.removeFirst() }
+        let id = UUID(), turn = generation
+        let message: [String: Any] = await withCheckedContinuation { done in
+            receiver = (id, done)
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, self.receiver?.id == id else { return }
+                let done = self.receiver?.done; self.receiver = nil
+                done?.resume(returning: ["event": "idle"])
             }
         }
-        port.disconnectHandler = { [weak self, weak port] _ in
-            MainActor.assumeIsolated {
-                guard let self, let port, self.peer === port else { return }
-                self.peer = nil; self.cancelPending()
-            }
+        try authorize(context)
+        guard generation == turn else { throw failure("Nord proxy changed.") }
+        return message
+    }
+
+    func answer(_ token: String, result: [String: Any], context: WKWebExtensionContext) throws {
+        try authorize(context)
+        guard let done = waiting.removeValue(forKey: token) else { return }
+        guard result["cancel"] as? Bool != true,
+              let auth = result["authCredentials"] as? [String: String],
+              let username = auth["username"], let password = auth["password"],
+              !username.isEmpty, !password.isEmpty else {
+            note(result["cancel"] as? Bool == true ? "auth-reply-cancel" : "auth-reply-empty")
+            done.resume(throwing: failure("Nord declined proxy authentication.")); return
         }
-        post(["ready": true])
+        done.resume(returning: ["username": username, "password": password, "requestID": token])
     }
 
     private func credentials(host: String, port: UInt16, destination: String) async throws -> [String: String] {
         let turn = generation
-        if peer?.isDisconnected != false, context?.isLoaded == true {
-            context?.loadBackgroundContent { _ in }
+        if Date().timeIntervalSince(lastReceive) >= 3, let context, context.isLoaded {
+            Task { [weak context] in try? await context?.loadBackgroundContent() }
         }
         // The worker can be starting while its first PAC setting is applied.
         for _ in 0..<50 {
-            if peer?.isDisconnected == false { break }
+            if Date().timeIntervalSince(lastReceive) < 3 { break }
             try await Task.sleep(for: .milliseconds(100))
             guard generation == turn else { throw failure("Nord proxy changed.") }
         }
-        guard peer?.isDisconnected == false, waiting.count < 128 else { throw failure("Nord authentication is unavailable.") }
+        guard Date().timeIntervalSince(lastReceive) < 3, waiting.count < 128 else { throw failure("Nord authentication is unavailable.") }
         let token = UUID().uuidString
         return try await withTaskCancellationHandler {
           try await withCheckedThrowingContinuation { continuation in
@@ -233,7 +254,10 @@ final class NordProxy {
                  "statusCode": 407, "statusLine": "HTTP/1.1 407 Proxy Authentication Required", "responseHeaders": []]])
             Task { [weak self] in
                 try? await Task.sleep(for: .seconds(10))
-                self?.waiting.removeValue(forKey: token)?.resume(throwing: failure("Nord authentication timed out."))
+                if let done = self?.waiting.removeValue(forKey: token) {
+                    self?.note("auth-timeout")
+                    done.resume(throwing: failure("Nord authentication timed out."))
+                }
             }
           }
         } onCancel: {
@@ -253,8 +277,21 @@ final class NordProxy {
         for done in old.values { done.resume(throwing: failure("Nord proxy changed.")) }
     }
     private func post(_ data: [String: Any]) {
-        guard let peer, !peer.isDisconnected else { return }
-        peer.sendMessage(data, completionHandler: nil)
+        guard context != nil else { return }
+        if let ready = receiver?.done {
+            receiver = nil
+            ready.resume(returning: data)
+        } else if notifications.count < 512 {
+            notifications.append(data)
+        } else {
+            // A stalled worker cannot accumulate messages or leave routing
+            // active without authentication and completion delivery.
+            notifications = [["event": "error", "details": ["fatal": true,
+                "error": "Nord authentication receiver stalled", "details": "Notification queue limit reached."]]]
+            cancelPending()
+            relay?.update(script: "function FindProxyForURL() { return 'PROXY localhost:0'; }")
+            note("receiver-overflow-blocked")
+        }
     }
 }
 

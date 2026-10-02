@@ -1374,10 +1374,6 @@ extension Extensions: WKWebExtensionControllerDelegate {
     }
 
     func webExtensionController(_ controller: WKWebExtensionController, connectUsing port: WKWebExtension.MessagePort, for extensionContext: WKWebExtensionContext) async throws {
-        if port.applicationIdentifier == NordProxy.application {
-            try NordProxy.shared.connect(port, context: extensionContext)
-            return
-        }
         if port.applicationIdentifier == ExtensionSocket.name {
             ExtensionSocket.connect(port, from: extensionContext.uniqueIdentifier)
             return
