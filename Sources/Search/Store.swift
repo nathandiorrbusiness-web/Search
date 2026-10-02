@@ -26,7 +26,9 @@ enum Store {
     /// measurement that needs a browser nobody has installed anything in,
     /// never borrow each other's. Nil for the browser somebody is using.
     static let world: String? = {
-        guard testing else { return nil }
+        guard testing else {
+            return ownContainer ? Bundle.main.bundleIdentifier : nil
+        }
         let asked = (ProcessInfo.processInfo.environment["SEARCH_PROBE"] ?? "").lowercased()
             .filter { ($0.isASCII && ($0.isLetter || $0.isNumber)) || $0 == "-" }
         return asked.isEmpty || asked == "1" || asked == "test" ? "test" : asked
@@ -48,8 +50,9 @@ enum Store {
     /// between probes the way the real one does. Wiping the test store is
     /// then as safe as wiping its folder.
     static var websites: WKWebsiteDataStore {
-        guard testing, !ownContainer else { return .default() }
-        return WKWebsiteDataStore(forIdentifier: probeStore(1))
+        let store = testing && !ownContainer ? WKWebsiteDataStore(forIdentifier: probeStore(1)) : .default()
+        MainActor.assumeIsolated { BrowserProxy.shared.attach(store) }
+        return store
     }
 
     /// Settings › Privacy › Prevent cross-site tracking, turned off. WebKit's
@@ -109,7 +112,7 @@ enum Store {
         let support = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let home = support.appendingPathComponent(world.map { "Search (\($0))" } ?? "Search", isDirectory: true)
-        if !testing {
+        if !testing, world == nil {
             let old = support.appendingPathComponent("Office Browser", isDirectory: true)
             let files = FileManager.default
             if !files.fileExists(atPath: home.path), files.fileExists(atPath: old.path) {
@@ -140,7 +143,7 @@ enum Store {
     /// Settings live apart too: a test that changes what the tabs wear or
     /// where the tabs go must not change yours.
     static let settings: UserDefaults = {
-        guard testing else {
+        guard world != nil else {
             carryOver(into: .standard)
             return .standard
         }

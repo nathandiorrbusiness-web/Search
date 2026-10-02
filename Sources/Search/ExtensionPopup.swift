@@ -26,6 +26,7 @@ final class ExtensionPopup: NSObject, WKUIDelegate, WKNavigationDelegate, NSPopo
     /// so "the current window" from a popup is the browser's, and so is the
     /// last focused one.
     private var page: PopupPage?
+    private(set) weak var originBrowser: Browser?
     private var measuring: Timer?
     private(set) var extensionID: String?
     /// The extension's own button, when the popup hangs from it.
@@ -33,19 +34,19 @@ final class ExtensionPopup: NSObject, WKUIDelegate, WKNavigationDelegate, NSPopo
     /// The popup a click on its own button just closed: the popover can go
     /// on mouse-down or mouse-up, before the button's press arrives — which
     /// would open it again.
-    private var closedByButton: (id: String, at: Date)?
+    private var closedByButton: (id: String, window: ObjectIdentifier, at: Date)?
 
     /// The popup's web view, while one is up — for the bench.
     var view: WKWebView? { web }
 
     /// The popup asking for the camera or microphone: asked on the card of
-    /// the window in front, named as the extension and remembered for it,
+    /// the originating window, named as the extension and remembered for it,
     /// as for any of its pages (see Browser.askedForCapture) — never
     /// WebKit's own dialog, and never without asking.
     func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin,
                  initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType,
                  decisionHandler: @escaping (WKPermissionDecision) -> Void) {
-        guard let browser = Browsers.front else { return decisionHandler(.deny) }
+        guard webView === web, let browser = originBrowser, browser.isOpen else { return decisionHandler(.deny) }
         browser.askedForCapture(webView, origin: origin, frame: frame, type: type, decisionHandler: decisionHandler)
     }
 
@@ -66,7 +67,7 @@ final class ExtensionPopup: NSObject, WKUIDelegate, WKNavigationDelegate, NSPopo
         return ["id": "popup", "url": url.absoluteString, "visible": isUp, "focused": isUp && web?.window?.isKeyWindow == true]
     }
 
-    func show(_ url: URL, for context: WKWebExtensionContext, from anchor: NSView?) {
+    func show(_ url: URL, for context: WKWebExtensionContext, from anchor: NSView?, in browser: Browser) {
         close()
         guard let configuration = context.webViewConfiguration else { return }
         // Sized the way Chrome sizes a popup (see preferred), unseen, while
@@ -100,22 +101,23 @@ final class ExtensionPopup: NSObject, WKUIDelegate, WKNavigationDelegate, NSPopo
         self.web = web
         self.popover = popover
         extensionID = context.uniqueIdentifier
-        button = anchor != nil && anchor === Extensions.shared.anchors[context.uniqueIdentifier]?.view ? anchor : nil
-        let page = PopupPage(web: web)
+        originBrowser = browser
+        button = anchor != nil && anchor === Extensions.shared.anchors[ObjectIdentifier(browser)]?[context.uniqueIdentifier]?.view ? anchor : nil
+        let page = PopupPage(web: web, browser: browser)
         self.page = page
         Extensions.shared.controller.didOpenTab(page)
 
         shown = false
-        if let anchor, anchor.window != nil {
+        if let anchor, anchor.window === browser.window {
             popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .maxY)
-        } else if let content = (NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain && $0.frame.minX > -10_000 }))?.contentView {
+        } else if let content = browser.window?.contentView {
             // No button to hang from — the column or the strip folded away:
             // where the buttons would be, the column's foot or the strip's
             // far end. The window's content is SwiftUI's, a flipped view,
             // whose top is at minY: measured from maxY, "the top right" was
             // the bottom right, across the window from the column's buttons.
             let bounds = content.bounds, flipped = content.isFlipped
-            let column = Extensions.shared.browser?.prefs.sidebar == true
+            let column = browser.prefs.sidebar
             let spot = column
                 ? NSRect(x: bounds.minX + 24, y: flipped ? bounds.maxY - 24 : bounds.minY + 24, width: 1, height: 1)
                 : NSRect(x: bounds.maxX - 60, y: flipped ? bounds.minY + 40 : bounds.maxY - 40, width: 1, height: 1)
@@ -179,6 +181,7 @@ final class ExtensionPopup: NSObject, WKUIDelegate, WKNavigationDelegate, NSPopo
         popover = nil
         web = nil
         extensionID = nil
+        originBrowser = nil
         button = nil
     }
 
@@ -186,13 +189,13 @@ final class ExtensionPopup: NSObject, WKUIDelegate, WKNavigationDelegate, NSPopo
     /// as in Chrome — whether the popover is still there (a click on the
     /// view it hangs from doesn't close it) or went on this click's
     /// mouse-down or mouse-up. Closed, it is not opened again.
-    func closes(_ id: String) -> Bool {
+    func closes(_ id: String, in browser: Browser) -> Bool {
         defer { closedByButton = nil }
-        if popover != nil, extensionID == id {
+        if popover != nil, extensionID == id, originBrowser === browser {
             close()
             return true
         }
-        guard let closed = closedByButton, closed.id == id else { return false }
+        guard let closed = closedByButton, closed.id == id, let window = browser.window, closed.window == ObjectIdentifier(window) else { return false }
         return Date().timeIntervalSince(closed.at) < 1.5
     }
 
@@ -343,7 +346,7 @@ final class ExtensionPopup: NSObject, WKUIDelegate, WKNavigationDelegate, NSPopo
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for action: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         // The same rule as tabs.create: never a file on this Mac, never javascript:.
         if let url = action.request.url, (try? Extensions.mayOpen(url)) != nil {
-            Extensions.shared.browser?.open(url, foreground: true)
+            originBrowser?.open(url, foreground: true)
         }
         close()
         return nil
@@ -357,7 +360,7 @@ final class ExtensionPopup: NSObject, WKUIDelegate, WKNavigationDelegate, NSPopo
               let button, let window = button.window, let event = NSApp.currentEvent,
               event.window === window, event.type == .leftMouseDown || event.type == .leftMouseUp else { return }
         let spot = button.convert(event.locationInWindow, from: nil)
-        if button.bounds.contains(spot) { closedByButton = (id, Date()) }
+        if button.bounds.contains(spot) { closedByButton = (id, ObjectIdentifier(window), Date()) }
     }
 
     /// Only for the popover that is up: closing the last one animates, and
@@ -376,10 +379,11 @@ final class ExtensionPopup: NSObject, WKUIDelegate, WKNavigationDelegate, NSPopo
 @MainActor
 final class PopupPage: NSObject, WKWebExtensionTab {
     weak var web: WKWebView?
+    private weak var browser: Browser?
 
-    init(web: WKWebView) { self.web = web }
+    init(web: WKWebView, browser: Browser) { self.web = web; self.browser = browser }
 
-    func window(for context: WKWebExtensionContext) -> (any WKWebExtensionWindow)? { Extensions.shared.window }
+    func window(for context: WKWebExtensionContext) -> (any WKWebExtensionWindow)? { browser.map(Extensions.shared.window(of:)) }
     func indexInWindow(for context: WKWebExtensionContext) -> Int { NSNotFound }
     func webView(for context: WKWebExtensionContext) -> WKWebView? { web }
     func title(for context: WKWebExtensionContext) -> String? { web?.title }
@@ -388,4 +392,3 @@ final class PopupPage: NSObject, WKWebExtensionTab {
     func isSelected(for context: WKWebExtensionContext) -> Bool { false }
     func close(for context: WKWebExtensionContext) async throws { ExtensionPopup.shared.close() }
 }
-

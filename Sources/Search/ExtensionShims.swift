@@ -1946,6 +1946,7 @@ enum ExtensionShims {
         ResourceType: resourceTypes, MAX_HANDLER_BEHAVIOR_CHANGED_CALLS_PER_10_MINUTES: 20,
         handlerBehaviorChanged: resolve(undefined), onActionIgnored: event(),
       });
+      \#(NordProxy.shim)
       fill("declarativeNetRequest", {
         GUARANTEED_MINIMUM_STATIC_RULES: 30000, MAX_NUMBER_OF_REGEX_RULES: 1000, MAX_NUMBER_OF_SESSION_RULES: 5000,
         MAX_NUMBER_OF_UNSAFE_DYNAMIC_RULES: 5000, MAX_NUMBER_OF_UNSAFE_SESSION_RULES: 5000,
@@ -2194,6 +2195,7 @@ enum ExtensionShims {
       // WebKit reports anyway — are added with the options it does take.
       if (chrome.webRequest) for (const key of Object.keys(chrome.webRequest)) {
         const target = chrome.webRequest[key];
+        if (key === "onAuthRequired" && runtime.id === "fjoaledfpmneenckfbpdfhkmimnjocfa") continue;
         if (!/^on[A-Z]/.test(key) || !target || typeof target.addListener !== "function") continue;
         const add = target.addListener.bind(target);
         put(target, "addListener", (listener, filter, spec) => {
@@ -3355,9 +3357,33 @@ enum ExtensionShims {
     }
 
     private static func run(_ api: String, _ args: [Any], context: WKWebExtensionContext, owner: Extensions) async throws -> Any? {
-        guard let browser = owner.browser else { throw Unsupported(what: "No browser window") }
         let first = args.first
         let id = context.uniqueIdentifier
+        if api == "nord.receive" || api == "nord.answer" {
+            func authorizeNord() throws {
+                let permissions = allowed(id, context: context)
+                guard id == NordProxy.extensionID,
+                      context.webExtension.manifest["version"] as? String == "6.1.1",
+                      permissions.contains("proxy"), permissions.contains("webRequest"),
+                      context.isLoaded, owner.contexts[id] === context else {
+                    throw Unsupported(what: "Nord authentication is unavailable.")
+                }
+            }
+            try authorizeNord()
+            if api == "nord.receive" {
+                guard args.isEmpty else { throw Unsupported(what: "Invalid Nord receive request.") }
+                let message = try await NordProxy.shared.receive(context)
+                try authorizeNord()
+                return message
+            }
+            guard args.count == 2, let token = first as? String, UUID(uuidString: token) != nil,
+                  let result = args[1] as? [String: Any] else {
+                throw Unsupported(what: "Invalid Nord authentication answer.")
+            }
+            try NordProxy.shared.answer(token, result: result, context: context)
+            return nil
+        }
+        guard let browser = owner.browser else { throw Unsupported(what: "No browser window") }
 
         if api.hasPrefix("setting.") {
             // A browser setting (chrome.privacy…) belongs to the family its
@@ -3368,7 +3394,7 @@ enum ExtensionShims {
             guard !family.isEmpty, allowed(id, context: context).contains(family) else {
                 throw Unsupported(what: "The extension never asked for \u{201C}\(family)\u{201D}")
             }
-            return setting(api, first as? [String: Any] ?? [:], extension: id, owner: owner)
+            return try await setting(api, first as? [String: Any] ?? [:], extension: id, context: context, owner: owner)
         }
 
         // What leaves this app is answered here, not in the injected script:
@@ -4169,10 +4195,20 @@ enum ExtensionShims {
     /// launches as Chrome keeps it. Search acts on one of them — an
     /// extension turning the browser's own offer to save passwords off,
     /// which is how every password manager asks Chrome to step aside.
-    private static func setting(_ api: String, _ details: [String: Any], extension id: String, owner: Extensions) -> Any? {
+    private static func setting(_ api: String, _ details: [String: Any], extension id: String, context: WKWebExtensionContext, owner: Extensions) async throws -> Any? {
         let parts = api.split(separator: ":", maxSplits: 1).map(String.init)
         guard parts.count == 2 else { return nil }
         let name = parts[1]
+        if name == "proxy.settings", parts[0] != "setting.get" {
+            if parts[0] == "setting.clear" {
+                guard id == NordProxy.extensionID else { throw Unsupported(what: "This proxy extension has no native routing support") }
+                try await NordProxy.shared.set(["mode": "system"], context: context)
+            } else {
+                guard let value = details["value"] as? [String: Any] else { throw Unsupported(what: "No proxy configuration") }
+                try await NordProxy.shared.set(value, context: context)
+            }
+        }
+        // Native proxy setup suspends; preserve settings written meanwhile.
         var mine = Extensions.settings(for: id)
         switch parts[0] {
         case "setting.set":
