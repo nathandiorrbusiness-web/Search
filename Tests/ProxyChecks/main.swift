@@ -76,7 +76,7 @@ struct ProxyChecks {
     @MainActor static func main() {
         _ = NSApplication.shared
         Task { @MainActor in
-            do { guard #available(macOS 15.4, *) else { throw NSError(domain: "requires macOS 15.4", code: 1) }; try await run(); print("PASS: real WebKit worker authentication (normal/private) and unauthorized/stopped channel rejection, PAC HTTPS/plaintext distinction and kill switch, startup blocking, disconnect race, TCP half-close, authenticated relay/direct bypass, normal/private WebKit routing, validation, persistence, failure atomicity, unreachable-proxy failure and reset"); exit(0) }
+            do { guard #available(macOS 15.4, *) else { throw NSError(domain: "requires macOS 15.4", code: 1) }; try await run(); print("PASS: real WebKit worker authentication (normal/private) and unauthorized/stopped channel rejection, suspended route notifications and restored-channel isolation, PAC HTTPS/plaintext distinction and kill switch, startup blocking, disconnect race, TCP half-close, authenticated relay/direct bypass, normal/private WebKit routing, validation, persistence, failure atomicity, unreachable-proxy failure and reset"); exit(0) }
             catch { print("FAIL: \(error)"); exit(1) }
         }
         NSApp.run()
@@ -228,6 +228,30 @@ struct ProxyChecks {
     }
 
     @available(macOS 15.4, *)
+    @MainActor static func checkNotifications(context: WKWebExtensionContext) async throws {
+        let controller = WKWebExtensionController(configuration: .nonPersistent())
+        try controller.load(context)
+        defer { NordProxy.shared.stop(); try? controller.unload(context) }
+        try await NordProxy.shared.set(["mode": "direct"], context: context)
+        _ = try await NordProxy.shared.receive(context)
+        let poll = Task { try await NordProxy.shared.receive(context) }
+        try await Task.sleep(for: .milliseconds(50))
+        try await NordProxy.shared.set(["mode": "system"], context: context)
+        let notification = try await poll.value
+        try require(notification["event"] as? String == "changed" &&
+                    (notification["value"] as? [String: Any])?["mode"] as? String == "system",
+                    "settings change discarded the suspended receiver's notification")
+        let old = Task { try await NordProxy.shared.receive(context) }
+        try await Task.sleep(for: .milliseconds(50))
+        NordProxy.shared.stop()
+        await NordProxy.shared.restore(context)
+        do { _ = try await old.value; throw NSError(domain: "stopped receive crossed a restored channel", code: 1) }
+        catch { try require((error as NSError).domain == "Search.NordProxy", "wrong obsolete-receiver rejection") }
+        let restored = try await NordProxy.shared.receive(context)
+        try require(restored["event"] as? String == "changed", "restored channel lost its own notification")
+    }
+
+    @available(macOS 15.4, *)
     @MainActor static func run() async throws {
         guard CommandLine.arguments.count >= 2, let port = UInt16(CommandLine.arguments[1]) else { fatalError("pass fixture port") }
         let script = "function FindProxyForURL(url, host) { return dnsDomainIs(host, '.invalid') ? 'PROXY 127.0.0.1:\(port)' : 'DIRECT'; }"
@@ -268,6 +292,7 @@ struct ProxyChecks {
         try require(sharedStore.proxyConfigurations.isEmpty, "stale change reinstated proxy after disconnect")
         try await checkHalfClose(script: script)
         try await checkWorker(script: script)
+        try await checkNotifications(context: context)
         let defaults = Store.settings
         let proxy = BrowserProxy(defaults: defaults, password: "", savePassword: { _ in })
         let value = ProxySettingsValue(mode: .http, host: "127.0.0.1", port: String(port), username: "fixture")

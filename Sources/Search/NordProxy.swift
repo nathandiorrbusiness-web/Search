@@ -80,6 +80,7 @@ final class NordProxy {
     private weak var context: WKWebExtensionContext?
     private var waiting: [String: CheckedContinuation<[String: String], Error>] = [:]
     private var generation = UUID()
+    private var receiverGeneration = UUID()
     private var transition = UUID()
     private var checkpoints: [String] = []
     var diagnostics: [String: Any] {
@@ -109,6 +110,7 @@ final class NordProxy {
             throw failure("Proxy extensions require native support; this build supports NordVPN 6.1.1.")
         }
         if self.context !== context {
+            receiverGeneration = UUID()
             cancelPending()
             let stopped = receiver?.done; receiver = nil
             notifications.removeAll()
@@ -177,6 +179,7 @@ final class NordProxy {
 
     func stop() {
         transition = UUID()
+        receiverGeneration = UUID()
         context = nil
         lastReceive = .distantPast
         let stopped = receiver?.done; receiver = nil
@@ -203,7 +206,7 @@ final class NordProxy {
         guard receiver == nil else { throw failure("Nord already has a pending receive.") }
         lastReceive = Date()
         if !notifications.isEmpty { return notifications.removeFirst() }
-        let id = UUID(), turn = generation
+        let id = UUID(), turn = receiverGeneration
         let message: [String: Any] = await withCheckedContinuation { done in
             receiver = (id, done)
             Task { [weak self] in
@@ -214,7 +217,9 @@ final class NordProxy {
             }
         }
         try authorize(context)
-        guard generation == turn else { throw failure("Nord proxy changed.") }
+        // Route changes cancel credentials, but their notifications still
+        // belong to this receiver. Only stop/context replacement invalidates it.
+        guard receiverGeneration == turn else { throw failure("Nord receiver changed.") }
         return message
     }
 
